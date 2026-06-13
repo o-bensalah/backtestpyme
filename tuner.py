@@ -1,9 +1,10 @@
 import itertools
 import pandas as pd
-from backtester import run_backtest, compute_metrics
+from backtester import run_stress_test
 
 
-def tune(strategy_class, param_grid, prices, risk_free, metric="sharpe_ratio"):
+def tune(strategy_class, param_grid, prices, risk_free, windows,
+         initial_capital=100_000, fee_rate=0.0, benchmark=None, metric="sharpe_ratio"):
     keys = list(param_grid.keys())
     combos = list(itertools.product(*param_grid.values()))
 
@@ -11,22 +12,12 @@ def tune(strategy_class, param_grid, prices, risk_free, metric="sharpe_ratio"):
     for combo in combos:
         params = dict(zip(keys, combo))
         strategy = strategy_class(**params)
-        portfolio = run_backtest(prices, strategy)
-        metrics = compute_metrics(portfolio["equity"], risk_free)
-        rows.append({**params, **metrics})
+        stress = run_stress_test(prices, strategy, risk_free, windows,
+                                 initial_capital=initial_capital, fee_rate=fee_rate,
+                                 benchmark=benchmark)
+        for _, window_row in stress.iterrows():
+            rows.append({**params, **window_row.to_dict()})
 
     results = pd.DataFrame(rows)
-    results = results.sort_values(metric, ascending=False).reset_index(drop=True)
+    results = results.sort_values(["start date", metric], ascending=[True, False]).reset_index(drop=True)
     return results
-
-
-if __name__ == "__main__":
-    from backtester import load_data
-    from cheapestN import CheapestN
-
-    prices = load_data("data/sp500_data.csv")
-    risk_free = load_data("data/tbill_data.csv")["^IRX"]
-
-    param_grid = {"n": range(1, 500)}
-    results = tune(CheapestN, param_grid, prices, risk_free)
-    print(results.to_string())

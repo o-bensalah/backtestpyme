@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import random
 from cheapestN import CheapestN
 
 def load_data(filepath):
@@ -52,6 +53,34 @@ def compute_metrics(portfolio, risk_free):
         "max_drawdown": round(float(max_drawdown), 4),
     } 
 
+def generate_windows(index, n_timeframes, min_period):
+    valid_ends = index[min_period:]
+    windows = []
+    for _ in range(n_timeframes):
+        end = random.choice(valid_ends)
+        end_loc = index.get_loc(end)
+        start = index[random.randint(0, end_loc - min_period)]
+        windows.append((start, end))
+    return windows
+
+
+def run_stress_test(prices, strategy, risk_free, windows, initial_capital=100_000, fee_rate=0.0, benchmark=None):
+    rows = []
+    for start, end in windows:
+        slice_prices = prices.loc[start:end]
+        portfolio = run_backtest(slice_prices, strategy, initial_capital, fee_rate)
+        metrics = compute_metrics(portfolio["equity"], risk_free)
+
+        if benchmark is not None:
+            spy_metrics = compute_metrics(benchmark.loc[start:end], risk_free)
+            spy_metrics = {f"spy_{k}": v for k, v in spy_metrics.items() if k not in ("start date", "end date")}
+            metrics = {**metrics, **spy_metrics}
+
+        rows.append(metrics)
+
+    return pd.DataFrame(rows)
+
+
 def print_metrics(metrics, header=""):
     print("=" * 40)
     print(header.center(40))
@@ -61,20 +90,40 @@ def print_metrics(metrics, header=""):
 
 
 if __name__ == "__main__":
-    initial_capital=100_000
-    fee_rate = 0.011
+    import argparse
+    from tuner import tune
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stress", action="store_true", help="Run stress test over random timeframes")
+    parser.add_argument("--tune", action="store_true", help="Grid search over param combos using stress test")
+    parser.add_argument("--timeframes", type=int, default=10, help="Number of random timeframes")
+    parser.add_argument("--period", type=int, default=90, help="Minimum period in trading days")
+    parser.add_argument("--fee", type=float, default=0.011, help="Fee rate per trade")
+    parser.add_argument("--capital", type=float, default=100_000, help="Initial capital")
+    args = parser.parse_args()
 
     prices = load_data("data/sp500_data.csv")
     risk_free = load_data("data/tbill_data.csv")["^IRX"]
     index = load_data("data/spy_data.csv")["SPY"]
 
-    portfolio = run_backtest(prices, CheapestN(25), initial_capital, fee_rate)
+    if args.tune:
+        windows = generate_windows(prices.index, args.timeframes, args.period)
+        param_grid = {"n": range(1, 50)}
+        results = tune(CheapestN, param_grid, prices, risk_free, windows,
+                       initial_capital=args.capital, fee_rate=args.fee, benchmark=index)
+        print(results.to_string())
 
-    stategy_metrics = compute_metrics(portfolio["equity"], risk_free)
-    print_metrics(stategy_metrics, "Buy and hold 25 cheapest stocks metrics")
+    elif args.stress:
+        windows = generate_windows(prices.index, args.timeframes, args.period)
+        stress = run_stress_test(prices, CheapestN(), risk_free, windows,
+                                 initial_capital=args.capital, fee_rate=args.fee,
+                                 benchmark=index)
+        print(stress.to_string())
 
-    index_metrics = compute_metrics(index, risk_free)
-    print_metrics(index_metrics, "SPY metrics")
+    else:
+        portfolio = run_backtest(prices, CheapestN(), args.capital, args.fee)
+        print_metrics(compute_metrics(portfolio["equity"], risk_free), "CheapestN")
+        print_metrics(compute_metrics(index, risk_free), "SPY")
 
     
 
