@@ -3,6 +3,24 @@ import numpy as np
 import random
 from cheapestN import CheapestN
 
+STRATEGIES = {
+    "cheapestN": CheapestN,
+}
+
+def parse_params(param_list):
+    if not param_list:
+        return {}
+    params = {}
+    for p in param_list:
+        key, val = p.split("=", 1)
+        for cast in (int, float, str):
+            try:
+                params[key] = cast(val)
+                break
+            except ValueError:
+                continue
+    return params
+
 def load_data(filepath):
     return pd.read_csv(filepath, index_col="Date", parse_dates=True)
 
@@ -93,37 +111,76 @@ if __name__ == "__main__":
     import argparse
     from tuner import tune
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--stress", action="store_true", help="Run stress test over random timeframes")
-    parser.add_argument("--tune", action="store_true", help="Grid search over param combos using stress test")
-    parser.add_argument("--timeframes", type=int, default=10, help="Number of random timeframes")
-    parser.add_argument("--period", type=int, default=90, help="Minimum period in trading days")
-    parser.add_argument("--fee", type=float, default=0.011, help="Fee rate per trade")
-    parser.add_argument("--capital", type=float, default=100_000, help="Initial capital")
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Equity strategy backtester",
+        epilog=(
+            "examples:\n"
+            "  python backtester.py --test --strategy cheapestN\n"
+            "  python backtester.py --test --strategy cheapestN --param n=10 --fee 0.001\n"
+            "  python backtester.py --stress --strategy cheapestN --timeframes 20 --period 180\n"
+            "  python backtester.py --stress --strategy cheapestN --param n=25\n"
+            "  python backtester.py --tune --strategy cheapestN --timeframes 10 --period 90\n"
+        )
+    )
+
+    modes = parser.add_argument_group("modes (one required)")
+    modes.add_argument("--test", action="store_true",
+                       help="Simple backtest on full dataset")
+    modes.add_argument("--stress", action="store_true",
+                       help="Stress test across random timeframes")
+    modes.add_argument("--tune", action="store_true",
+                       help="Grid search over strategy params using stress test windows")
+
+    strategy_args = parser.add_argument_group("strategy")
+    strategy_args.add_argument("--strategy", default=None, choices=STRATEGIES.keys(),
+                               help="(required) strategy to run [all modes]")
+    strategy_args.add_argument("--param", action="append", metavar="key=value",
+                               help="(optional) strategy constructor param, repeatable\n"
+                                    "  e.g. --param n=10  [--test, --stress only]")
+
+    run_args = parser.add_argument_group("run options")
+    run_args.add_argument("--fee", type=float, default=0.011,
+                          help="Fee rate per trade (default: 0.011) [all modes]")
+    run_args.add_argument("--capital", type=float, default=100_000,
+                          help="Initial capital (default: 100000) [all modes]")
+    run_args.add_argument("--timeframes", type=int, default=10,
+                          help="Number of random windows (default: 10) [--stress, --tune]")
+    run_args.add_argument("--period", type=int, default=90,
+                          help="Minimum window length in trading days (default: 90) [--stress, --tune]")
     args = parser.parse_args()
 
     prices = load_data("data/sp500_data.csv")
     risk_free = load_data("data/tbill_data.csv")["^IRX"]
     index = load_data("data/spy_data.csv")["SPY"]
 
-    if args.tune:
-        windows = generate_windows(prices.index, args.timeframes, args.period)
-        param_grid = {"n": range(1, 50)}
-        results = tune(CheapestN, param_grid, prices, risk_free, windows,
-                       initial_capital=args.capital, fee_rate=args.fee, benchmark=index)
-        print(results.to_string())
+    no_mode = not (args.test or args.stress or args.tune)
+    if no_mode or args.strategy is None:
+        parser.print_help()
+
+    elif args.test:
+        strategy_class = STRATEGIES[args.strategy]
+        params = parse_params(args.param)
+        portfolio = run_backtest(prices, strategy_class(**params), args.capital, args.fee)
+        print_metrics(compute_metrics(portfolio["equity"], risk_free), args.strategy)
+        print_metrics(compute_metrics(index, risk_free), "SPY")
 
     elif args.stress:
+        strategy_class = STRATEGIES[args.strategy]
+        params = parse_params(args.param)
         windows = generate_windows(prices.index, args.timeframes, args.period)
-        stress = run_stress_test(prices, CheapestN(), risk_free, windows,
+        stress = run_stress_test(prices, strategy_class(**params), risk_free, windows,
                                  initial_capital=args.capital, fee_rate=args.fee,
                                  benchmark=index)
         print(stress.to_string())
 
-    else:
-        portfolio = run_backtest(prices, CheapestN(), args.capital, args.fee)
-        print_metrics(compute_metrics(portfolio["equity"], risk_free), "CheapestN")
-        print_metrics(compute_metrics(index, risk_free), "SPY")
+    elif args.tune:
+        strategy_class = STRATEGIES[args.strategy]
+        param_grid = {"n": range(1, 50)}
+        windows = generate_windows(prices.index, args.timeframes, args.period)
+        results = tune(strategy_class, param_grid, prices, risk_free, windows,
+                       initial_capital=args.capital, fee_rate=args.fee, benchmark=index)
+        print(results.to_string())
 
     
 
