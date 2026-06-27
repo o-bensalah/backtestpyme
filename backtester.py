@@ -2,9 +2,11 @@ import pandas as pd
 import numpy as np
 import random
 from cheapestN import CheapestN
+from momentum import Momentum
 
 STRATEGIES = {
     "cheapestN": CheapestN,
+    "momentum": Momentum,
 }
 
 def parse_params(param_list):
@@ -20,6 +22,16 @@ def parse_params(param_list):
             except ValueError:
                 continue
     return params
+
+def parse_param_grid(tune_param_list):
+    if not tune_param_list:
+        return {}
+    grid = {}
+    for p in tune_param_list:
+        key, val = p.split("=", 1)
+        start, stop = val.split(":")
+        grid[key] = range(int(start), int(stop))
+    return grid
 
 def load_data(filepath):
     return pd.read_csv(filepath, index_col="Date", parse_dates=True)
@@ -118,9 +130,10 @@ if __name__ == "__main__":
             "examples:\n"
             "  python backtester.py --test --strategy cheapestN\n"
             "  python backtester.py --test --strategy cheapestN --param n=10 --fee 0.001\n"
-            "  python backtester.py --stress --strategy cheapestN --timeframes 20 --period 180\n"
-            "  python backtester.py --stress --strategy cheapestN --param n=25\n"
-            "  python backtester.py --tune --strategy cheapestN --timeframes 10 --period 90\n"
+            "  python backtester.py --stress --strategy cheapestN --timeframes 20 --end 2025-01-01 --period 180\n"
+            "  python backtester.py --stress --strategy cheapestN --param n=25 --start 2024-01-01 --end 2025-06-01\n"
+            "  python backtester.py --tune --strategy cheapestN --tune-param n=1:50 --end 2025-01-01 --period 252\n"
+            "  python backtester.py --tune --strategy momentum --tune-param portfolio_size=1:30 --tune-param windows=5:50 --start 2025-01-01 --end 2026-05-29\n"
         )
     )
 
@@ -138,6 +151,9 @@ if __name__ == "__main__":
     strategy_args.add_argument("--param", action="append", metavar="key=value",
                                help="(optional) strategy constructor param, repeatable\n"
                                     "  e.g. --param n=10  [--test, --stress only]")
+    strategy_args.add_argument("--tune-param", action="append", metavar="key=start:stop",
+                               help="(optional) param range to tune over, repeatable\n"
+                                    "  e.g. --tune-param portfolio_size=1:30  [--tune only]")
 
     run_args = parser.add_argument_group("run options")
     run_args.add_argument("--fee", type=float, default=0.011,
@@ -145,14 +161,42 @@ if __name__ == "__main__":
     run_args.add_argument("--capital", type=float, default=100_000,
                           help="Initial capital (default: 100000) [all modes]")
     run_args.add_argument("--timeframes", type=int, default=10,
-                          help="Number of random windows (default: 10) [--stress, --tune]")
-    run_args.add_argument("--period", type=int, default=90,
-                          help="Minimum window length in trading days (default: 90) [--stress, --tune]")
+                          help="Number of random windows (default: 10) [--stress only]")
+
+    date_args = parser.add_argument_group(
+        "date range (specify exactly 2 of: --start, --end, --period — or none for full dataset)"
+    )
+    date_args.add_argument("--start", type=str, default=None, metavar="YYYY-MM-DD",
+                           help="Start date")
+    date_args.add_argument("--end", type=str, default=None, metavar="YYYY-MM-DD",
+                           help="End date")
+    date_args.add_argument("--period", type=int, default=None, metavar="DAYS",
+                           help="Range length in trading days")
     args = parser.parse_args()
 
     prices = load_data("data/sp500_data.csv")
     risk_free = load_data("data/tbill_data.csv")["^IRX"]
     index = load_data("data/spy_data.csv")["SPY"]
+
+    n_date_args = sum(x is not None for x in [args.start, args.end, args.period])
+    if n_date_args == 3:
+        parser.error("specify at most 2 of --start, --end, --period")
+    elif n_date_args == 1:
+        parser.error("specify exactly 2 of --start, --end, --period (or none for full dataset)")
+    elif args.start is not None and args.end is not None:
+        prices = prices.loc[args.start:args.end]
+        index = index.loc[args.start:args.end]
+        min_period = len(prices) // 2
+    elif args.start is not None and args.period is not None:
+        prices = prices.loc[args.start:].iloc[:args.period]
+        index = index.loc[args.start:].iloc[:args.period]
+        min_period = args.period // 2
+    elif args.end is not None and args.period is not None:
+        prices = prices.loc[:args.end].iloc[-args.period:]
+        index = index.loc[:args.end].iloc[-args.period:]
+        min_period = args.period // 2
+    else:
+        min_period = 90
 
     no_mode = not (args.test or args.stress or args.tune)
     if no_mode or args.strategy is None:
@@ -168,7 +212,7 @@ if __name__ == "__main__":
     elif args.stress:
         strategy_class = STRATEGIES[args.strategy]
         params = parse_params(args.param)
-        windows = generate_windows(prices.index, args.timeframes, args.period)
+        windows = generate_windows(prices.index, args.timeframes, min_period)
         stress = run_stress_test(prices, strategy_class(**params), risk_free, windows,
                                  initial_capital=args.capital, fee_rate=args.fee,
                                  benchmark=index)
@@ -176,11 +220,13 @@ if __name__ == "__main__":
 
     elif args.tune:
         strategy_class = STRATEGIES[args.strategy]
-        param_grid = {"n": range(1, 50)}
-        windows = generate_windows(prices.index, args.timeframes, args.period)
-        results = tune(strategy_class, param_grid, prices, risk_free, windows,
-                       initial_capital=args.capital, fee_rate=args.fee, benchmark=index)
-        print(results.to_string())
+        param_grid = parse_param_grid(args.tune_param)
+        if not param_grid:
+            print("Error: --tune requires at least one --tune-param key=start:stop")
+        else:
+            results = tune(strategy_class, param_grid, prices, risk_free,
+                           initial_capital=args.capital, fee_rate=args.fee, benchmark=index)
+            print(results.to_string())
 
     
 
